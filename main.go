@@ -2,82 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Bundle creates a single-source-file version of a source package
-// suitable for inclusion in a particular target package.
-//
-// Usage:
-//
-//	bundle [-o file] [-dst path] [-pkg name] [-prefix p] [-import old=new] <src>
-//
-// The src argument specifies the import path of the package to bundle.
-// The bundling of a directory of source files into a single source file
-// necessarily imposes a number of constraints.
-// The package being bundled must not use cgo; must not use conditional
-// file compilation, whether with build tags or system-specific file names
-// like code_amd64.go; must not depend on any special comments, which
-// may not be preserved; must not use any assembly sources;
-// must not use renaming imports; and must not use reflection-based APIs
-// that depend on the specific names of types or struct fields.
-//
-// By default, bundle writes the bundled code to standard output.
-// If the -o argument is given, bundle writes to the named file
-// and also includes a ``//go:generate'' comment giving the exact
-// command line used, for regenerating the file with ``go generate.''
-//
-// Bundle customizes its output for inclusion in a particular package, the destination package.
-// By default bundle assumes the destination is the package in the current directory,
-// but the destination package can be specified explicitly using the -dst option,
-// which takes an import path as its argument.
-// If the source package imports the destination package, bundle will remove
-// those imports and rewrite any references to use direct references to the
-// corresponding symbols.
-// Bundle also must write a package declaration in the output and must
-// choose a name to use in that declaration.
-// If the -package option is given, bundle uses that name.
-// Otherwise, if the -dst option is given, bundle uses the last
-// element of the destination import path.
-// Otherwise, by default bundle uses the package name found in the
-// package sources in the current directory.
-//
-// To avoid collisions, bundle inserts a prefix at the beginning of
-// every package-level const, func, type, and var identifier in src's code,
-// updating references accordingly. The default prefix is the package name
-// of the source package followed by an underscore. The -prefix option
-// specifies an alternate prefix.
-//
-// Occasionally it is necessary to rewrite imports during the bundling
-// process. The -import option, which may be repeated, specifies that
-// an import of "old" should be rewritten to import "new" instead.
-//
-// Example
-//
-// Bundle archive/zip for inclusion in cmd/dist:
-//
-//	cd $GOROOT/src/cmd/dist
-//	bundle -o zip.go archive/zip
-//
-// Bundle golang.org/x/net/http2 for inclusion in net/http,
-// prefixing all identifiers by "http2" instead of "http2_",
-// and rewriting the import "golang.org/x/net/http2/hpack"
-// to "internal/golang.org/x/net/http2/hpack":
-//
-//	cd $GOROOT/src/net/http
-//	bundle -o h2_bundle.go \
-//		-prefix http2 \
-//		-import golang.org/x/net/http2/hpack=internal/golang.org/x/net/http2/hpack \
-//		golang.org/x/net/http2
-//
-// Two ways to update the http2 bundle:
-//
-//	go generate net/http
-//
-//	cd $GOROOT/src/net/http
-//	go generate
-//
-// Update both bundles, restricting ``go generate'' to running bundle commands:
-//
-//	go generate -run bundle cmd/dist net/http
-//
 package main
 
 import (
@@ -95,8 +19,11 @@ import (
 	"log"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
+
+	fsnotify "gopkg.in/fsnotify.v1"
 
 	"golang.org/x/tools/go/loader"
 )
@@ -128,22 +55,20 @@ func addImportMap(s string) {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: bundle [options] <src>\n")
+	fmt.Fprintf(os.Stderr, "Usage: bundle [options] <output file>\n")
 	flag.PrintDefaults()
 }
 
 func main() {
-	log.SetPrefix("bundle: ")
+	log.SetPrefix("cg-bundle: ")
 	log.SetFlags(0)
 
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
-	if len(args) != 1 {
-		usage()
-		os.Exit(2)
+	if len(args) == 1 {
+		*outputFile = args[0]
 	}
-
 	if *dstPath != "" {
 		if *pkgName == "" {
 			*pkgName = path.Base(*dstPath)
@@ -159,22 +84,53 @@ func main() {
 			*pkgName = pkg.Name
 		}
 	}
-
-	code, err := bundle(args[0], *dstPath, *pkgName, *prefix)
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if *outputFile != "" {
-		err := ioutil.WriteFile(*outputFile, code, 0666)
-		if err != nil {
-			log.Fatal(err)
+	defer watcher.Close()
+
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case event := <-watcher.Events:
+				if filepath.Ext(event.Name) != ".go" {
+					continue
+				}
+
+				//log.Println("event:", event)
+				if event.Op&fsnotify.Write == fsnotify.Write ||
+					event.Op&fsnotify.Create == fsnotify.Create {
+					//log.Println("modified file:", event.Name)
+					code, err := bundle(".", *dstPath, "main", " ")
+					if err != nil {
+						log.Println(err)
+					}
+					//log.Println("done")
+					if *outputFile != "" {
+						err := ioutil.WriteFile(*outputFile, code, 0666)
+						if err != nil {
+							log.Fatal(err)
+						}
+					} else {
+						_, err := os.Stdout.Write(code)
+						if err != nil {
+							log.Fatal(err)
+						}
+					}
+				}
+			case err := <-watcher.Errors:
+				log.Println("error:", err)
+			}
 		}
-	} else {
-		_, err := os.Stdout.Write(code)
-		if err != nil {
-			log.Fatal(err)
-		}
+	}()
+
+	err = watcher.Add(".")
+	if err != nil {
+		log.Fatal(err)
 	}
+	<-done
 }
 
 // isStandardImportPath is copied from cmd/go in the standard library.
@@ -239,13 +195,7 @@ func bundle(src, dst, dstpkg, prefix string) ([]byte, error) {
 
 	var out bytes.Buffer
 
-	fmt.Fprintf(&out, "// Code generated by golang.org/x/tools/cmd/bundle. DO NOT EDIT.\n")
-	if *outputFile != "" {
-		fmt.Fprintf(&out, "//go:generate bundle %s\n", strings.Join(os.Args[1:], " "))
-	} else {
-		fmt.Fprintf(&out, "//   $ bundle %s\n", strings.Join(os.Args[1:], " "))
-	}
-	fmt.Fprintf(&out, "\n")
+	fmt.Fprintf(&out, "// Code generated by github.com/inhies/cg-bundle\n\n")
 
 	// Concatenate package comments from all files...
 	for _, f := range info.Files {
